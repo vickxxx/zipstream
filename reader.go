@@ -47,6 +47,8 @@ type Entry struct {
 	hasReadNum                 uint64
 	hasDataDescriptorSignature bool
 	eof                        bool
+	headerOffset               int64 // includes overall ZIP archive baseOffset
+
 }
 
 func (e *Entry) hasDataDescriptor() bool {
@@ -89,74 +91,122 @@ func NewReader(r io.Reader) *Reader {
 
 func (z *Reader) readEntry() (*Entry, error) {
 
-	buf := make([]byte, fileHeaderLen)
-	if _, err := io.ReadFull(z.r, buf); err != nil {
+	// buf := make([]byte, fileHeaderLen)
+	// if _, err := io.ReadFull(z.r, buf); err != nil {
+	// 	return nil, fmt.Errorf("unable to read local file header: %w", err)
+	// }
+
+	// lr := readBuf(buf)
+
+	var buf [directoryHeaderLen]byte
+	if _, err := io.ReadFull(z.r, buf[:]); err != nil {
 		return nil, fmt.Errorf("unable to read local file header: %w", err)
 	}
+	lr := readBuf(buf[:])
 
-	lr := readBuf(buf)
-
-	readerVersion := lr.uint16()
-	flags := lr.uint16()
-	method := lr.uint16()
-	modifiedTime := lr.uint16()
-	modifiedDate := lr.uint16()
-	crc32Sum := lr.uint32()
-	compressedSize := lr.uint32()
-	uncompressedSize := lr.uint32()
-	filenameLen := int(lr.uint16())
-	extraAreaLen := int(lr.uint16())
-
-	entry := &Entry{
-		FileHeader: zip.FileHeader{
-			ReaderVersion:      readerVersion,
-			Flags:              flags,
-			Method:             method,
-			ModifiedTime:       modifiedTime,
-			ModifiedDate:       modifiedDate,
-			CRC32:              crc32Sum,
-			CompressedSize:     compressedSize,
-			UncompressedSize:   uncompressedSize,
-			CompressedSize64:   uint64(compressedSize),
-			UncompressedSize64: uint64(uncompressedSize),
-		},
-		r:          z.r,
-		hasReadNum: 0,
-		eof:        false,
+	if sig := lr.uint32(); sig != directoryHeaderSignature {
+		return nil, zip.ErrFormat
 	}
 
-	nameAndExtraBuf := make([]byte, filenameLen+extraAreaLen)
+	b := lr
+	f := zip.FileHeader{}
+	f.CreatorVersion = b.uint16()
+	f.ReaderVersion = b.uint16()
+	f.Flags = b.uint16()
+	f.Method = b.uint16()
+	f.ModifiedTime = b.uint16()
+	f.ModifiedDate = b.uint16()
+	f.CRC32 = b.uint32()
+	f.CompressedSize = b.uint32()
+	f.UncompressedSize = b.uint32()
+	f.CompressedSize64 = uint64(f.CompressedSize)
+	f.UncompressedSize64 = uint64(f.UncompressedSize)
+	filenameLen := int(b.uint16())
+	extraLen := int(b.uint16())
+	commentLen := int(b.uint16())
+	b = b[4:] // skipped start disk number and internal attributes (2x uint16)
+	f.ExternalAttrs = b.uint32()
+
+	headerOffset := int64(b.uint32())
+	d := make([]byte, filenameLen+extraLen+commentLen)
+	if _, err := io.ReadFull(z.r, d); err != nil {
+		return nil, err
+	}
+	f.Name = string(d[:filenameLen])
+	f.Extra = d[filenameLen : filenameLen+extraLen]
+	f.Comment = string(d[filenameLen+extraLen:])
+
+	// readerVersion := lr.uint16()
+	// flags := lr.uint16()
+	// method := lr.uint16()
+	// modifiedTime := lr.uint16()
+	// modifiedDate := lr.uint16()
+	// crc32Sum := lr.uint32()
+	// compressedSize := lr.uint32()
+	// uncompressedSize := lr.uint32()
+	// // filenameLen := int(lr.uint16())
+	// extraAreaLen := int(lr.uint16())
+
+	entry := &Entry{
+		FileHeader:   f,
+		r:            z.r,
+		hasReadNum:   0,
+		eof:          false,
+		headerOffset: headerOffset,
+	}
+
+	nameAndExtraBuf := make([]byte, filenameLen+extraLen)
 	if _, err := io.ReadFull(z.r, nameAndExtraBuf); err != nil {
 		return nil, fmt.Errorf("unable to read entry name and extra area: %w", err)
 	}
 
-	entry.Name = string(nameAndExtraBuf[:filenameLen])
-	entry.Extra = nameAndExtraBuf[filenameLen:]
+	// Determine the character encoding.
+	utf8Valid1, utf8Require1 := detectUTF8(f.Name)
+	utf8Valid2, utf8Require2 := detectUTF8(f.Comment)
+	switch {
+	case !utf8Valid1 || !utf8Valid2:
+		// Name and Comment definitely not UTF-8.
+		f.NonUTF8 = true
+	case !utf8Require1 && !utf8Require2:
+		// Name and Comment use only single-byte runes that overlap with UTF-8.
+		f.NonUTF8 = false
+	default:
+		// Might be UTF-8, might be some other encoding; preserve existing flag.
+		// Some ZIP writers use UTF-8 encoding without setting the UTF-8 flag.
+		// Since it is impossible to always distinguish valid UTF-8 from some
+		// other encoding (e.g., GBK or Shift-JIS), we trust the flag.
+		f.NonUTF8 = f.Flags&0x800 == 0
+	}
 
-	entry.NonUTF8 = flags&0x800 == 0
-	if flags&1 == 1 {
+	// entry.Name = string(nameAndExtraBuf[:filenameLen])
+	// entry.Extra = nameAndExtraBuf[filenameLen:]
+
+	// entry.NonUTF8 = flags&0x800 == 0
+	if f.Flags&1 == 1 {
 		return nil, fmt.Errorf("encrypted ZIP entry not supported")
 	}
-	if flags&8 == 8 && method != CompressMethodDeflated {
+	if f.Flags&8 == 8 && f.Method != CompressMethodDeflated {
 		return nil, fmt.Errorf("only DEFLATED entries can have data descriptor")
 	}
 
 	needCSize := entry.CompressedSize == ^uint32(0)
 	needUSize := entry.UncompressedSize == ^uint32(0)
+	needHeaderOffset := entry.headerOffset == int64(^uint32(0))
 
-	ler := readBuf(entry.Extra)
+	// ler := readBuf(entry.Extra)
 	var modified time.Time
 parseExtras:
-	for len(ler) >= 4 { // need at least tag and size
-		fieldTag := ler.uint16()
-		fieldSize := int(ler.uint16())
-		if len(ler) < fieldSize {
+
+	for extra := readBuf(f.Extra); len(extra) >= 4; { // need at least tag and size
+		fieldTag := extra.uint16()
+		fieldSize := int(extra.uint16())
+		if len(extra) < fieldSize {
 			break
 		}
-		fieldBuf := ler.sub(fieldSize)
+		fieldBuf := extra.sub(fieldSize)
 
 		switch fieldTag {
-		case Zip64ExtraID:
+		case zip64ExtraID:
 			entry.zip64 = true
 
 			// update directory values from the zip64 extra block.
@@ -168,16 +218,23 @@ parseExtras:
 				if len(fieldBuf) < 8 {
 					return nil, zip.ErrFormat
 				}
-				entry.UncompressedSize64 = fieldBuf.uint64()
+				f.UncompressedSize64 = fieldBuf.uint64()
 			}
 			if needCSize {
 				needCSize = false
 				if len(fieldBuf) < 8 {
 					return nil, zip.ErrFormat
 				}
-				entry.CompressedSize64 = fieldBuf.uint64()
+				f.CompressedSize64 = fieldBuf.uint64()
 			}
-		case NtfsExtraID:
+			if needHeaderOffset {
+				needHeaderOffset = false
+				if len(fieldBuf) < 8 {
+					return nil, zip.ErrFormat
+				}
+				entry.headerOffset = int64(fieldBuf.uint64())
+			}
+		case ntfsExtraID:
 			if len(fieldBuf) < 4 {
 				continue parseExtras
 			}
@@ -196,18 +253,18 @@ parseExtras:
 				const ticksPerSecond = 1e7    // Windows timestamp resolution
 				ts := int64(attrBuf.uint64()) // ModTime since Windows epoch
 				secs := ts / ticksPerSecond
-				nsecs := (1e9 / ticksPerSecond) * int64(ts%ticksPerSecond)
+				nsecs := (1e9 / ticksPerSecond) * (ts % ticksPerSecond)
 				epoch := time.Date(1601, time.January, 1, 0, 0, 0, 0, time.UTC)
 				modified = time.Unix(epoch.Unix()+secs, nsecs)
 			}
-		case UnixExtraID, InfoZipUnixExtraID:
+		case unixExtraID, infoZipUnixExtraID:
 			if len(fieldBuf) < 8 {
 				continue parseExtras
 			}
 			fieldBuf.uint32()              // AcTime (ignored)
 			ts := int64(fieldBuf.uint32()) // ModTime since Unix epoch
 			modified = time.Unix(ts, 0)
-		case ExtTimeExtraID:
+		case extTimeExtraID:
 			if len(fieldBuf) < 5 || fieldBuf.uint8()&1 == 0 {
 				continue parseExtras
 			}
@@ -216,8 +273,79 @@ parseExtras:
 		}
 	}
 
+	// for len(ler) >= 4 { // need at least tag and size
+	// 	fieldTag := ler.uint16()
+	// 	fieldSize := int(ler.uint16())
+	// 	if len(ler) < fieldSize {
+	// 		break
+	// 	}
+	// 	fieldBuf := ler.sub(fieldSize)
+
+	// 	switch fieldTag {
+	// 	case Zip64ExtraID:
+	// 		entry.zip64 = true
+
+	// 		// update directory values from the zip64 extra block.
+	// 		// They should only be consulted if the sizes read earlier
+	// 		// are maxed out.
+	// 		// See golang.org/issue/13367.
+	// 		if needUSize {
+	// 			needUSize = false
+	// 			if len(fieldBuf) < 8 {
+	// 				return nil, zip.ErrFormat
+	// 			}
+	// 			entry.UncompressedSize64 = fieldBuf.uint64()
+	// 		}
+	// 		if needCSize {
+	// 			needCSize = false
+	// 			if len(fieldBuf) < 8 {
+	// 				return nil, zip.ErrFormat
+	// 			}
+	// 			entry.CompressedSize64 = fieldBuf.uint64()
+	// 		}
+	// 	case NtfsExtraID:
+	// 		if len(fieldBuf) < 4 {
+	// 			continue parseExtras
+	// 		}
+	// 		fieldBuf.uint32()        // reserved (ignored)
+	// 		for len(fieldBuf) >= 4 { // need at least tag and size
+	// 			attrTag := fieldBuf.uint16()
+	// 			attrSize := int(fieldBuf.uint16())
+	// 			if len(fieldBuf) < attrSize {
+	// 				continue parseExtras
+	// 			}
+	// 			attrBuf := fieldBuf.sub(attrSize)
+	// 			if attrTag != 1 || attrSize != 24 {
+	// 				continue // Ignore irrelevant attributes
+	// 			}
+
+	// 			const ticksPerSecond = 1e7    // Windows timestamp resolution
+	// 			ts := int64(attrBuf.uint64()) // ModTime since Windows epoch
+	// 			secs := ts / ticksPerSecond
+	// 			nsecs := (1e9 / ticksPerSecond) * int64(ts%ticksPerSecond)
+	// 			epoch := time.Date(1601, time.January, 1, 0, 0, 0, 0, time.UTC)
+	// 			modified = time.Unix(epoch.Unix()+secs, nsecs)
+	// 		}
+	// 	case UnixExtraID, InfoZipUnixExtraID:
+	// 		if len(fieldBuf) < 8 {
+	// 			continue parseExtras
+	// 		}
+	// 		fieldBuf.uint32()              // AcTime (ignored)
+	// 		ts := int64(fieldBuf.uint32()) // ModTime since Unix epoch
+	// 		modified = time.Unix(ts, 0)
+	// 	case ExtTimeExtraID:
+	// 		if len(fieldBuf) < 5 || fieldBuf.uint8()&1 == 0 {
+	// 			continue parseExtras
+	// 		}
+	// 		ts := int64(fieldBuf.uint32()) // ModTime since Unix epoch
+	// 		modified = time.Unix(ts, 0)
+	// 	}
+	// }
+
 	msDosModified := MSDosTimeToTime(entry.ModifiedDate, entry.ModifiedTime)
 	entry.Modified = msDosModified
+	// msdosModified := msDosTimeToTime(f.ModifiedDate, f.ModifiedTime)
+	// f.Modified = msdosModified
 
 	if !modified.IsZero() {
 		entry.Modified = modified.UTC()
