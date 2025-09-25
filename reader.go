@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	headerIdentifierLen      = 4
-	fileHeaderLen            = 26
+	headerIdentifierLen = 4
+	// fileHeaderLen            = 26
 	dataDescriptorLen        = 16 // four uint32: descriptor signature, crc32, compressed size, size
 	fileHeaderSignature      = 0x04034b50
 	directoryHeaderSignature = 0x02014b50
@@ -379,9 +379,7 @@ func readDataDescriptor(r io.Reader, entry *Entry) error {
 	//
 	// dataDescriptorLen includes the size of the signature but
 	// first read just those 4 bytes to see if it exists.
-	n, err := io.ReadFull(r, buf[:4])
-	entry.hasReadNum += uint64(n)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf[:4]); err != nil {
 		return err
 	}
 	off := 0
@@ -390,15 +388,10 @@ func readDataDescriptor(r io.Reader, entry *Entry) error {
 		// No data descriptor signature. Keep these four
 		// bytes.
 		off += 4
-	} else {
-		entry.hasDataDescriptorSignature = true
 	}
-	n, err = io.ReadFull(r, buf[off:12])
-	entry.hasReadNum += uint64(n)
-	if err != nil {
+	if _, err := io.ReadFull(r, buf[off:12]); err != nil {
 		return err
 	}
-	entry.eof = true
 	b := readBuf(buf[:12])
 	if b.uint32() != entry.CRC32 {
 		return zip.ErrChecksum
@@ -413,12 +406,22 @@ func readDataDescriptor(r io.Reader, entry *Entry) error {
 	return nil
 }
 
+type File struct {
+	FileHeader
+	zip          *Reader
+	zipr         io.ReaderAt
+	headerOffset int64 // includes overall ZIP archive baseOffset
+	zip64        bool  // zip64 extended information extra field presence
+}
+
 type checksumReader struct {
 	rc    io.ReadCloser
 	hash  hash.Hash32
 	nread uint64 // number of bytes read so far
+	// f     *File
 	entry *Entry
-	err   error // sticky error
+	desr  io.Reader // if non-nil, where to read the data descriptor
+	err   error     // sticky error
 }
 
 func (r *checksumReader) Read(b []byte) (n int, err error) {
@@ -428,7 +431,9 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 	n, err = r.rc.Read(b)
 	r.hash.Write(b[:n])
 	r.nread += uint64(n)
-	r.entry.hasReadNum += uint64(n)
+	if r.nread > r.entry.UncompressedSize64 {
+		return 0, zip.ErrFormat
+	}
 	if err == nil {
 		return
 	}
@@ -436,8 +441,8 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 		if r.nread != r.entry.UncompressedSize64 {
 			return 0, io.ErrUnexpectedEOF
 		}
-		if r.entry.hasDataDescriptor() {
-			if err1 := readDataDescriptor(r.entry.r, r.entry); err1 != nil {
+		if r.desr != nil {
+			if err1 := readDataDescriptor(r.desr, r.entry); err1 != nil {
 				if err1 == io.EOF {
 					err = io.ErrUnexpectedEOF
 				} else {
@@ -450,7 +455,6 @@ func (r *checksumReader) Read(b []byte) (n int, err error) {
 			// If there's not a data descriptor, we still compare
 			// the CRC32 of what we've read against the file header
 			// or TOC's CRC32, if it seems like it was set.
-			r.entry.eof = true
 			if r.entry.CRC32 != 0 && r.hash.Sum32() != r.entry.CRC32 {
 				err = zip.ErrChecksum
 			}
